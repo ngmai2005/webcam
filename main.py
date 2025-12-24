@@ -1,257 +1,219 @@
-# Tên file: main.py (FINAL - Bia 3 Chuyển Động)
 import cv2
 import numpy as np
+import time
 import os
 import math
-import time
+import threading
+import csv
+from datetime import datetime
+from playsound import playsound
 
-# ====================================================================
-# I. KHỐI CẤU HÌNH & TẢI ẢNH (CONFIG & GAME STATE)
-# ====================================================================
+# ================== CONFIG ==================
+WIDTH, HEIGHT = 1280, 720
+IMAGE_SIZE = 340          # phóng to bia
+CAM_INDEX = 0             # cam rời thường là 1
+SHOT_COOLDOWN = 0.12
+TARGET_TIME = 7           # 7s mỗi bia
+MAX_SHOTS = 16
 
-# Kích thước khung hình Calibrate (1280x720)
-TARGET_WIDTH = 1280
-TARGET_HEIGHT = 720
+FLIP_MODE = 1
+TARGET_CENTER = (WIDTH // 2, HEIGHT // 2)
 
-# Trạng thái Game
-CURRENT_TARGET_INDEX = 0
-MAX_TARGETS = 3
-TOTAL_SCORE = 0
-RANGE_FACTOR = 1.0
+MODE = "THI"              # "THI" hoặc "HUAN_LUYEN"
 
-# Tọa độ gốc của các Bia
-TARGET_POSITIONS_STATIC = {
-    0: (640, 360),  # Bia 1: Chính giữa (Tĩnh)
-    1: (640, 360),  # Bia 2: Chính giữa (Tĩnh)
-    2: (640, 360)  # Bia 3: Vị trí gốc (Anchor/Tâm)
-}
+# ================== LOAD TARGET IMAGES ==================
+TARGET_IMAGES = []
+for i in range(1, 5):
+    img = cv2.imread(f"images/target{i}.png")
+    if img is None:
+        print(f"❌ Thiếu images/target{i}.png")
+        exit()
+    TARGET_IMAGES.append(cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE)))
 
-# Quản lý Bia di động (ĐÃ KHÔI PHỤC LOGIC CHUYỂN ĐỘNG)
-TARGET3_X_OFFSET = 0
-TARGET3_MOTION_SPEED = 3
-TARGET3_DIRECTION = 1
-MOTION_BOUNDARY_LIMIT = 500  # Giới hạn di chuyển (Rất rộng)
+# ================== SOUND ==================
+def play_hit_sound():
+    threading.Thread(
+        target=playsound,
+        args=("sounds/hit.mp3",),
+        daemon=True
+    ).start()
 
-SHOW_CAMERA_WINDOW = False
+# ================== CALIBRATION ==================
+def load_matrix():
+    if not os.path.exists("calibration_points.npy"):
+        print("❌ Chưa calibrate")
+        exit()
 
-# --- TẢI ẢNH BÊN NGOÀI VÒNG LẶP ---
-TARGET_IMAGES = None
-try:
-    # KÍCH THƯỚC ẢNH ĐƯỢC TẢI (300 pixels)
-    IMAGE_SIZE = 300
-    img_files = ['images/target1.png', 'images/target2.png', 'images/target3.png']
-    loaded_imgs = []
+    src = np.load("calibration_points.npy", allow_pickle=True)
+    src = np.array(src, dtype=np.float32)
 
-    for file in img_files:
-        img = cv2.imread(file, cv2.IMREAD_UNCHANGED)
-        if img is None:
-            raise FileNotFoundError(f"Không tìm thấy file: {file}")
-        loaded_imgs.append(cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE)))
+    dst = np.float32([
+        [0, 0],
+        [WIDTH, 0],
+        [WIDTH, HEIGHT],
+        [0, HEIGHT]
+    ])
 
-    TARGET_IMAGES = loaded_imgs
-    print("✅ Tải ảnh bia thành công.")
+    return cv2.getPerspectiveTransform(src, dst)
 
-except Exception as e:
-    print(f"❌ Lỗi tải ảnh (dùng fallback hình vuông): {e}")
-    TARGET_IMAGES = None
+# ================== LASER DETECTION ==================
+def detect_laser(frame, M):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
+    lower1 = np.array([0, 120, 200])
+    upper1 = np.array([10, 255, 255])
+    lower2 = np.array([160, 120, 200])
+    upper2 = np.array([180, 255, 255])
 
-# ====================================================================
-# II. UTILITIES & THUẬT TOÁN HỖ TRỢ
-# ====================================================================
+    mask = cv2.inRange(hsv, lower1, upper1) | cv2.inRange(hsv, lower2, upper2)
 
-def load_calibration_matrix():
-    """Tải 4 điểm từ file .npy và tính Ma trận Perspective M"""
-    if not os.path.exists('calibration_points.npy'):
-        print("❌ Không tìm thấy calibration_points.npy. Hãy chạy calibration.py.")
-        return None
-    try:
-        source_points = np.load('calibration_points.npy').astype(np.float32)
-        DEST_POINTS = np.float32([
-            [0, 0], [TARGET_WIDTH, 0],
-            [TARGET_WIDTH, TARGET_HEIGHT], [0, TARGET_HEIGHT]
-        ])
-        M = cv2.getPerspectiveTransform(source_points, DEST_POINTS)
-        return M
-    except Exception as e:
-        return None
+    kernel = np.ones((3,3), np.uint8)
+    mask = cv2.erode(mask, kernel, 1)
+    mask = cv2.dilate(mask, kernel, 2)
 
-
-def find_and_map_laser(frame, M):
-    """Tìm Laser IR (chỉ dùng ngưỡng sáng) và ánh xạ sang tọa độ Bia chuẩn"""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    _, mask_bright = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
-    mask_combined = cv2.GaussianBlur(mask_bright, (7, 7), 0)
-    _, mask_combined = cv2.threshold(mask_combined, 50, 255, cv2.THRESH_BINARY)
-    contours, _ = cv2.findContours(mask_combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if not contours: return None
-    largest = max(contours, key=cv2.contourArea)
-    area = cv2.contourArea(largest)
-    if area < 6: return None
-
-    M_dot = cv2.moments(largest)
-    if M_dot["m00"] == 0: return None
-
-    cam_x = int(M_dot["m10"] / M_dot["m00"])
-    cam_y = int(M_dot["m01"] / M_dot["m00"])
-
-    try:
-        pts = np.float32([[[cam_x, cam_y]]])
-        transformed = cv2.perspectiveTransform(pts, M)
-        final_x = int(transformed[0, 0, 0])
-        final_y = int(transformed[0, 0, 1])
-        final_x = max(0, min(TARGET_WIDTH - 1, final_x))
-        final_y = max(0, min(TARGET_HEIGHT - 1, final_y))
-        return (final_x, final_y, cam_x, cam_y)
-    except Exception as e:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
         return None
 
+    c = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(c) < 8:
+        return None
 
-def update_target_3_position():
-    """Cập nhật vị trí ngang của Bia số 3 (Di động)"""
-    global TARGET3_X_OFFSET, TARGET3_DIRECTION
-    TARGET3_X_OFFSET += TARGET3_MOTION_SPEED * TARGET3_DIRECTION
-    if TARGET3_X_OFFSET > MOTION_BOUNDARY_LIMIT:
-        TARGET3_DIRECTION = -1
-    elif TARGET3_X_OFFSET < -MOTION_BOUNDARY_LIMIT:
-        TARGET3_DIRECTION = 1
-    ox, oy = TARGET_POSITIONS_STATIC[2]
-    return (ox + TARGET3_X_OFFSET, oy)
+    m = cv2.moments(c)
+    if m["m00"] == 0:
+        return None
 
+    x = int(m["m10"] / m["m00"])
+    y = int(m["m01"] / m["m00"])
 
-def get_current_target_pos():
-    """Trả về tọa độ (x, y) của bia đang hoạt động. Bia 3 có chuyển động."""
-    if CURRENT_TARGET_INDEX == 2:
-        # BIA 3: Dùng hàm cập nhật vị trí chuyển động
-        return update_target_3_position()
-    elif 0 <= CURRENT_TARGET_INDEX < 2:
-        # BIA 1 & 2: Dùng vị trí tĩnh (trung tâm)
-        return TARGET_POSITIONS_STATIC[CURRENT_TARGET_INDEX]
-    return (0, 0)
+    pt = np.float32([[[x, y]]])
+    mapped = cv2.perspectiveTransform(pt, M)
 
+    return int(mapped[0][0][0]), int(mapped[0][0][1])
 
-def overlay_image_alpha(bg, fg, x, y):
-    """Ghép fg (có alpha) lên bg tại (x,y)"""
-    h, w = fg.shape[0], fg.shape[1]
-    if x >= bg.shape[1] or y >= bg.shape[0]: return bg
-    x1, x2 = max(x, 0), min(x + w, bg.shape[1])
-    y1, y2 = max(y, 0), min(y + h, bg.shape[0])
-    x1_fg, x2_fg = x1 - x, x2 - x
-    y1_fg, y2_fg = y1 - y, y2 - y
-    if x1 >= x2 or y1 >= y2: return bg
+# ================== ZONE ==================
+def get_zone(dist):
+    if dist < 30:
+        return "TAM"
+    elif dist < 70:
+        return "GIUA"
+    return "NGOAI"
 
-    if fg.shape[2] == 4:
-        alpha = fg[y1_fg:y2_fg, x1_fg:x2_fg, 3] / 255.0
-        for c in range(3):
-            bg[y1:y2, x1:x2, c] = (alpha * fg[y1_fg:y2_fg, x1_fg:x2_fg, c] + (1 - alpha) * bg[y1:y2, x1:x2, c])
-    else:
-        bg[y1:y2, x1:x2] = fg[y1_fg:y2_fg, x1_fg:x2_fg]
-    return bg
+# ================== MAIN ==================
+def main():
+    M = load_matrix()
+    cap = cv2.VideoCapture(CAM_INDEX)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-
-def draw_target_graphics(canvas, target_index, target_x, target_y, is_active=False):
-    """Vẽ hình ảnh Bia (Đã phóng to và bỏ vòng tròn)."""
-    global TARGET_IMAGES
-
-    # RADIUS fallback (150)
-    RADIUS = 150
-
-    # 1. VẼ HÌNH ẢNH (Ưu tiên)
-    if TARGET_IMAGES is not None and target_index < len(TARGET_IMAGES):
-        img = TARGET_IMAGES[target_index]
-        h, w = img.shape[:2]
-        xs = int(target_x - w // 2);
-        ys = int(target_y - h // 2)
-        overlay_image_alpha(canvas, img, xs, ys)
-    else:
-        # Fallback
-        color = (255, 100, 100) if target_index == 0 else (100, 255, 100)
-        cv2.circle(canvas, (int(target_x), int(target_y)), RADIUS, color, -1)
-
-    # 2. Vẽ tâm bia (Đã tăng kích thước)
-    cv2.circle(canvas, (int(target_x), int(target_y)), 12, (255, 255, 255), -1)
-
-
-# ====================================================================
-# IV. VÒNG LẶP CHÍNH (MAIN EXECUTION)
-# ====================================================================
-
-def main_loop():
-    global CURRENT_TARGET_INDEX, TOTAL_SCORE
-
-    M = load_calibration_matrix()
-    if M is None: return
-
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     if not cap.isOpened():
-        print("❌ LỖI: Không thể mở camera (index 0). Thử thay 0 -> 1 hoặc 2.")
+        print("❌ Không mở được camera")
         return
 
-    cv2.namedWindow('Laser Trainer UI', cv2.WINDOW_AUTOSIZE)
+    # ===== CSV =====
+    csv_file = open("report.csv", "w", newline="", encoding="utf-8")
+    writer = csv.writer(csv_file)
+    writer.writerow(["time","target","x","y","zone","score"])
+
+    cv2.namedWindow("Laser Trainer", cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty("Laser Trainer", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+    current_target = 0
+    target_start = time.time()
+    score = 0
+    shots = 0
+    last_shot_time = 0
+
+    move_x = TARGET_CENTER[0] - IMAGE_SIZE//2
+    direction = 1
+
+    print("🎯 BAT DAU")
 
     while True:
         ret, frame = cap.read()
-        if not ret: break
-
-        result = find_and_map_laser(frame, M)
-        score = 0
-
-        # 1. Game over
-        if CURRENT_TARGET_INDEX >= MAX_TARGETS:
-            canvas = np.zeros((TARGET_HEIGHT, TARGET_WIDTH, 3), dtype=np.uint8)
-            cv2.putText(canvas, f'GAME OVER - Total Score: {TOTAL_SCORE}', (TARGET_WIDTH // 4, TARGET_HEIGHT // 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
-            cv2.imshow('Laser Trainer UI', canvas)
-            if cv2.waitKey(1) & 0xFF == ord('q'): break
-            continue
-
-        # 2. Xử lý Trúng đích
-        if result:
-            final_x, final_y, cam_x, cam_y = result
-            # Lấy vị trí hiện tại (có thể chuyển động nếu là Bia 3)
-            target_x, target_y = get_current_target_pos()
-            distance = math.hypot(final_x - target_x, final_y - target_y)
-            HIT_ZONE_RADIUS = 50 / RANGE_FACTOR
-
-            if distance < 15:
-                score = 10
-            elif distance < HIT_ZONE_RADIUS:
-                score = 5
-
-            if score > 0:
-                print(f"Bia {CURRENT_TARGET_INDEX + 1} HIT! Điểm {score}")
-                TOTAL_SCORE += score
-                CURRENT_TARGET_INDEX += 1  # CHỈ NHẢY KHI TRÚNG
-                time.sleep(0.8)
-
-        # 3. Draw UI canvas
-        canvas = np.zeros((TARGET_HEIGHT, TARGET_WIDTH, 3), dtype=np.uint8)
-
-        # Vẽ bia đang hoạt động
-        if CURRENT_TARGET_INDEX < MAX_TARGETS:
-            i = CURRENT_TARGET_INDEX
-            # Cần gọi get_current_target_pos() để lấy vị trí chuyển động của Bia 3
-            tx, ty = get_current_target_pos()
-            draw_target_graphics(canvas, i, tx, ty, is_active=True)
-
-        # Vẽ vết đạn (chỉ vẽ nếu bắn trúng)
-        if result and score > 0:
-            cv2.circle(canvas, (final_x, final_y), 8, (0, 0, 255), -1)
-
-            # HUD
-        cv2.putText(canvas, f'Total: {TOTAL_SCORE}', (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-        cv2.putText(canvas, f'Target: {CURRENT_TARGET_INDEX + 1}/{MAX_TARGETS}', (TARGET_WIDTH - 250, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
-
-        cv2.imshow('Laser Trainer UI', canvas)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        if not ret:
             break
 
+        frame = cv2.flip(frame, FLIP_MODE)
+        canvas = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+        now = time.time()
+        laser = detect_laser(frame, M)
+
+        # ===== TIME OUT =====
+        if now - target_start > TARGET_TIME:
+            current_target += 1
+            target_start = now
+
+        if current_target >= 4:
+            break
+
+        img = TARGET_IMAGES[current_target]
+
+        # ===== POSITION =====
+        if current_target == 3:
+            move_x += direction * 5
+            if move_x < 100 or move_x > WIDTH - IMAGE_SIZE - 100:
+                direction *= -1
+            tx = move_x
+        else:
+            tx = TARGET_CENTER[0] - IMAGE_SIZE//2
+
+        ty = TARGET_CENTER[1] - IMAGE_SIZE//2
+        canvas[ty:ty+IMAGE_SIZE, tx:tx+IMAGE_SIZE] = img
+
+        # ===== LASER =====
+        if laser and shots < MAX_SHOTS:
+            lx, ly = laser
+            cv2.circle(canvas, (lx, ly), 6, (0,0,255), -1)
+
+            inside = tx < lx < tx+IMAGE_SIZE and ty < ly < ty+IMAGE_SIZE
+
+            if inside and now - last_shot_time > SHOT_COOLDOWN:
+                last_shot_time = now
+                shots += 1
+                play_hit_sound()
+
+                cx, cy = tx+IMAGE_SIZE//2, ty+IMAGE_SIZE//2
+                dist = math.hypot(lx-cx, ly-cy)
+
+                if MODE == "THI":
+                    shot_score = 1
+                    score += 1
+                else:
+                    shot_score = 1
+                    score += 1
+
+                writer.writerow([
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    current_target+1,
+                    lx, ly,
+                    get_zone(dist),
+                    shot_score
+                ])
+
+                current_target += 1
+                target_start = now
+
+        # ===== UI =====
+        cv2.putText(canvas, f"SCORE: {score}", (30,50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,0), 3)
+        cv2.putText(canvas, f"SHOT: {shots}/{MAX_SHOTS}", (30,100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,0), 2)
+
+        cv2.imshow("Laser Trainer", canvas)
+
+        key = cv2.waitKey(1)
+        if key == 27:
+            break
+        if key == ord('r'):
+            current_target = 0
+            score = 0
+            shots = 0
+            target_start = time.time()
+
+    csv_file.close()
     cap.release()
     cv2.destroyAllWindows()
 
-
-if __name__ == '__main__':
-    main_loop()
+# ================== RUN ==================
+if __name__ == "__main__":
+    main()
