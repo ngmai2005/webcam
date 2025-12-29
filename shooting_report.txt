@@ -1,7 +1,0 @@
-=== LASER SHOOTING REPORT ===
-Time: 2025-12-18 21:51:47.472179
-Total Score: 21
-
-1. Target 1 | CHEST | +7 | (662,341)
-2. Target 2 | CHEST | +7 | (647,353)
-3. Target 3 | CHEST | +7 | (649,351)

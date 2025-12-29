@@ -1,52 +1,71 @@
 import cv2
 import numpy as np
+import os
 
-# ================= CONFIG =================
-WIDTH, HEIGHT = 1280, 720
 CAM_INDEX = 0
 FLIP_MODE = 1
 
 points = []
 
-# ================= MOUSE CLICK =================
-def click(event, x, y, flags, param):
+def mouse_callback(event, x, y, flags, param):
     global points
     if event == cv2.EVENT_LBUTTONDOWN and len(points) < 4:
-        points.append([x, y])
-        print(f"Point {len(points)}: {x}, {y}")
+        points.append((x, y))
+        print(f"📍 Point {len(points)}: {x}, {y}")
 
-# ================= CAMERA =================
-cap = cv2.VideoCapture(CAM_INDEX)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
-cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 
-cv2.namedWindow("CALIBRATION")
-cv2.setMouseCallback("CALIBRATION", click)
+cv2.namedWindow("CALIBRATE", cv2.WINDOW_NORMAL)
+cv2.setWindowProperty(
+    "CALIBRATE",
+    cv2.WND_PROP_FULLSCREEN,
+    cv2.WINDOW_FULLSCREEN
+)
 
-print("👉 Click 4 điểm theo thứ tự:")
-print("TOP-LEFT → TOP-RIGHT → BOTTOM-RIGHT → BOTTOM-LEFT")
+cv2.setMouseCallback("CALIBRATE", mouse_callback)
 
-# ================= LOOP =================
+print("👉 CLICK 4 DIEM: TL → TR → BR → BL")
+print("👉 BAM PHIM S DE LUU")
+
 while True:
     ret, frame = cap.read()
     if not ret:
         break
 
-    # 🔴 FLIP TRƯỚC KHI CLICK
     frame = cv2.flip(frame, FLIP_MODE)
 
-    for p in points:
-        cv2.circle(frame, tuple(p), 6, (0, 255, 0), -1)
-
-    cv2.imshow("CALIBRATION", frame)
+    for i, p in enumerate(points):
+        cv2.circle(frame, p, 8, (0, 0, 255), -1)
+        cv2.putText(
+            frame, str(i+1),
+            (p[0]+10, p[1]-10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 255, 0),
+            2
+        )
 
     if len(points) == 4:
-        np.save("calibration_points.npy", np.array(points, dtype=np.float32))
-        print("✅ Đã lưu calibration_points.npy")
+        cv2.polylines(
+            frame,
+            [np.array(points)],
+            True,
+            (0, 255, 0),
+            3
+        )
+
+    cv2.imshow("CALIBRATE", frame)
+
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord('s') and len(points) == 4:
+        np.save("roi.npy", np.array(points))
+        print("✅ DA LUU roi.npy TAI:", os.getcwd())
         break
 
-    if cv2.waitKey(1) & 0xFF == 27:
+    if key == 27:
         break
 
 cap.release()
