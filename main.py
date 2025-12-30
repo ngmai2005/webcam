@@ -51,81 +51,54 @@ def load_matrix():
     except:
         return None
 
-laser_history = []
-laser_armed = True
-
 # ================= DETECT_LASER =================
 
-def detect_laser(frame, M):
-    global laser_history, laser_armed
+def detect_laser(frame):
+    blur = cv2.GaussianBlur(frame, (5, 5), 0)
+    hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
 
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
 
-    # --- MASK MÀU LASER ---
-    mask_red = (
-        cv2.inRange(hsv, (0, 120, 200), (10, 255, 255)) |
-        cv2.inRange(hsv, (160, 120, 200), (180, 255, 255))
+    # lọc điểm sáng mạnh
+    bright = cv2.inRange(v, 240, 255)
+    sat = cv2.inRange(s, 120, 255)
+    base_mask = cv2.bitwise_and(bright, sat)
+
+    # lọc màu laser
+    red1 = cv2.inRange(hsv, (0, 120, 200), (10, 255, 255))
+    red2 = cv2.inRange(hsv, (160, 120, 200), (180, 255, 255))
+    green = cv2.inRange(hsv, (35, 120, 200), (90, 255, 255))
+    pink = cv2.inRange(hsv, (140, 80, 200), (165, 255, 255))
+
+    color_mask = red1 | red2 | green | pink
+
+    laser_mask = cv2.bitwise_and(base_mask, color_mask)
+
+    kernel = np.ones((3, 3), np.uint8)
+    laser_mask = cv2.morphologyEx(laser_mask, cv2.MORPH_OPEN, kernel)
+    laser_mask = cv2.dilate(laser_mask, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(
+        laser_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
-    mask_green = cv2.inRange(hsv, (35, 120, 200), (90, 255, 255))
-    mask = mask_red | mask_green
-
-    # --- LỌC NHIỄU ---
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if not contours:
-        laser_history.clear()
-        laser_armed = True
-        return None
+        return False, None
 
-    # --- LẤY ĐỐM SÁNG NHẤT ---
     c = max(contours, key=cv2.contourArea)
     area = cv2.contourArea(c)
 
-    if area < 2 or area > 80:
-        return None
+    if area < 4 or area > 250:
+        return False, None
 
-    m = cv2.moments(c)
-    if m["m00"] == 0:
-        return None
+    (x, y), r = cv2.minEnclosingCircle(c)
 
-    x = int(m["m10"] / m["m00"])
-    y = int(m["m01"] / m["m00"])
-
-    if hsv[y, x][2] < 200:
-        return None
-
-    # chỉ cần thấy laser là bắn
-    if not laser_armed:
-        return None
-
-    if not laser_armed:
-        return None
-
-    laser_armed = False
-    laser_history.clear()
-
-    if M is not None:
-        pt = np.float32([[[x, y]]])
-        mapped = cv2.perspectiveTransform(pt, M)
-        return int(mapped[0][0][0]), int(mapped[0][0][1])
-
-    laser_history.append((x, y))
-    if len(laser_history) > 5:
-        laser_history.pop(0)
-
-    if not laser_armed:
-        dx = max(p[0] for p in laser_history) - min(p[0] for p in laser_history)
-        dy = max(p[1] for p in laser_history) - min(p[1] for p in laser_history)
-        if dx < 3 and dy < 3:
-            laser_armed = True
-
-    return x, y
+    return True, (int(x), int(y))
 
 # ================= MAIN =================
 
 def main():
+    round_id = 1
     can_shoot = True
     cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
@@ -140,8 +113,7 @@ def main():
     bullets = 0
     hits = 0
     phase = 1
-    round_id = 1
-    MAX_ROUND = 2
+    MAX_ROUND = 1
     target_start = time.time()
     last_shot = 0
     hit_points = []
@@ -150,6 +122,15 @@ def main():
     show_2, show_3 = False, False
     key = -1
 
+    laser_prev = False
+
+    # ================= INIT TTS =================
+
+    engine = pyttsx3.init()
+    engine.setProperty('rate', 150)
+    engine.setProperty('volume', 1)
+    tts_spoken = False
+
     while True:
         ret, frame_raw = cap.read()
         if not ret:
@@ -157,26 +138,33 @@ def main():
 
         frame = cv2.flip(frame_raw, FLIP_MODE)
         H, W = frame.shape[:2]
-        laser = detect_laser(frame, M)
+        laser_detected, laser_pos = detect_laser(frame)
+        laser_now = laser_detected
+
+        if laser_detected:
+            lx, ly = laser_pos
         canvas = np.zeros((H, W, 3), dtype=np.uint8)
         now = time.time()
 
         # ================= PHASE LOGIC =================
         # ---- PHASE 1: BIA 1 ----
+
         if phase == 1:
             tx = W // 2 - IMAGE_SIZE // 2
             ty = H // 2 - IMAGE_SIZE // 2
             canvas[ty:ty + IMAGE_SIZE, tx:tx + IMAGE_SIZE] = TARGET_IMAGES[0]
 
-            if can_shoot and laser and now - last_shot > SHOT_COOLDOWN:
-                lx, ly = laser
+            if can_shoot and bullets < MAX_BULLETS and laser_now and not laser_prev and now - last_shot > SHOT_COOLDOWN:
                 bullets += 1
                 last_shot = now
+
+                if laser_detected:
+                    lx, ly = laser_pos
+
                 if tx < lx < tx + IMAGE_SIZE and ty < ly < ty + IMAGE_SIZE:
                     score += 1
                     hits += 1
                     play_hit_sound()
-                    laser_armed = True
                     phase = 2
                     target_start = now
                     show_2 = True
@@ -202,23 +190,24 @@ def main():
             if show_3:
                 canvas[ty:ty + IMAGE_SIZE, tx3:tx3 + IMAGE_SIZE] = TARGET_IMAGES[2]
 
-            if can_shoot and laser and now - last_shot > SHOT_COOLDOWN:
-                lx, ly = laser
+            if can_shoot and bullets < MAX_BULLETS and laser_now and not laser_prev and now - last_shot > SHOT_COOLDOWN:
                 bullets += 1
                 last_shot = now
+
+                if laser_detected:
+                    lx, ly = laser_pos
 
                 if show_2 and tx2 < lx < tx2 + IMAGE_SIZE and ty < ly < ty + IMAGE_SIZE:
                     score += 1
                     hits += 1
                     play_hit_sound()
-                    laser_armed = True
                     show_2 = False
+                    show_3 = True
 
                 elif show_3 and tx3 < lx < tx3 + IMAGE_SIZE and ty < ly < ty + IMAGE_SIZE:
                     score += 1
                     hits += 1
                     play_hit_sound()
-                    laser_armed = True
                     phase = 4
                     target_start = now
                     move_x = 100
@@ -238,16 +227,17 @@ def main():
             ty = H // 2 - IMAGE_SIZE // 2
             canvas[ty:ty + IMAGE_SIZE, move_x:move_x + IMAGE_SIZE] = TARGET_IMAGES[3]
 
-            if can_shoot and laser and now - last_shot > SHOT_COOLDOWN:
-                lx, ly = laser
+            if can_shoot and bullets < MAX_BULLETS and laser_now and not laser_prev and now - last_shot > SHOT_COOLDOWN:
                 bullets += 1
                 last_shot = now
+
+                if laser_detected:
+                    lx, ly = laser_pos
 
                 if move_x < lx < move_x + IMAGE_SIZE and ty < ly < ty + IMAGE_SIZE:
                     score += 1
                     hits += 1
                     play_hit_sound()
-                    laser_armed = True
                     if round_id < MAX_ROUND:
                         round_id += 1
                         phase = 1
@@ -263,11 +253,13 @@ def main():
                     round_id += 1
                     phase = 1
                     target_start = now
-                    show_2 = show_3 = False
+                    if round_id < MAX_ROUND:
+                        show_2 = show_3 = False
                     move_x = 100
                     direction = 1
                 else:
                     phase = 99
+        laser_prev = laser_now
 
         # ================= HIỆU ỨNG TRÚNG =================
         for px, py in hit_points:
@@ -280,11 +272,6 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
         cv2.putText(canvas, f"SHOT: {bullets}/{MAX_BULLETS}", (40, 110),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
-
-        # ================= INIT TTS =================
-        engine = pyttsx3.init()
-        engine.setProperty('rate', 150)
-        engine.setProperty('volume', 1)
 
         # ================= RESULT =================
         if phase == 99 or bullets >= MAX_BULLETS:
@@ -307,7 +294,12 @@ def main():
             cv2.putText(canvas, "NHAN R DE RESET", (WIDTH // 2 - 260, HEIGHT // 2 + 160),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
     # ================= PHÁT TTS =================
-            threading.Thread(target=lambda: engine.say(rank) or engine.runAndWait(), daemon=True).start()
+            if not tts_spoken:
+                threading.Thread(
+                    target=lambda: (engine.say(rank), engine.runAndWait()),
+                    daemon=True
+                ).start()
+                tts_spoken = True
 
         cv2.imshow("Laser Trainer", canvas)
 
@@ -325,9 +317,9 @@ def main():
             show_2 = show_3 = False
             move_x = 100
             direction = 1
-            laser_armed = True
             hit_points.clear()
             last_shot = 0
+            tts_spoken = False
 
     cap.release()
     cv2.destroyAllWindows()
