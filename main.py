@@ -3,12 +3,15 @@ import numpy as np
 import time
 import threading
 import os
-import pyttsx3
 from playsound import playsound
+import csv
+from datetime import datetime
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ================= CONFIG =================
 WIDTH, HEIGHT = 1280, 720
-IMAGE_SIZE = 420
+IMAGE_SIZE = 500
 CAM_INDEX = 0
 FLIP_MODE = 1
 
@@ -25,6 +28,24 @@ def play_hit_sound():
         daemon=True
     ).start()
 
+def play_result_sound(rank):
+    sound_map = {
+        "GIOI": "result_gioi.mp3",
+        "KHA": "result_kha.mp3",
+        "DAT": "result_dat.mp3",
+        "KHONG DAT": "result_khong_dat.mp3",
+    }
+
+    file = sound_map.get(rank)
+    if not file:
+        return
+
+    path = os.path.join(BASE_DIR, "sounds", file)
+    if not os.path.exists(path):
+        print("❌ Missing:", path)
+        return
+
+    playsound(path)
 
 # ================= LOAD TARGET IMAGES =================
 TARGET_IMAGES = []
@@ -74,9 +95,6 @@ def main():
     cv2.namedWindow("Laser Trainer", cv2.WINDOW_NORMAL)
     cv2.setWindowProperty("Laser Trainer", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    engine = pyttsx3.init()
-    engine.setProperty("rate", 150)
-
     score = bullets = hits = 0
     phase = 1
     sub_target = 2
@@ -89,6 +107,8 @@ def main():
 
     move_x, direction = 100, 1
     tts_spoken = False
+    result_time = None
+    result_datetime = None
 
     while True:
         ret, frame = cap.read()
@@ -186,6 +206,8 @@ def main():
                         target_start = now
                     else:
                         phase = 99
+                        result_time = time.time()
+                        result_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             elif now - target_start >= TARGET_TIME:
                 if round_id < MAX_ROUND:
@@ -194,6 +216,8 @@ def main():
                     target_start = now
                 else:
                     phase = 99
+                    result_time = time.time()
+                    result_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # ================= RESULT =================
         if phase == 99 or bullets >= MAX_BULLETS:
@@ -204,11 +228,67 @@ def main():
             cv2.putText(canvas, "NHAN R DE RESET", (420, 380),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
-            if not tts_spoken:
-                threading.Thread(
-                    target=lambda: (engine.say(rank), engine.runAndWait()),
-                    daemon=True
-                ).start()
+            # ===== RESULT TABLE =====
+            table_x, table_y = 360, 430
+            row_h = 45
+            col_w1, col_w2 = 260, 360
+
+            rows = [
+                ("THOI GIAN", result_datetime if result_datetime else ""),
+                ("SCORE", str(score)),
+                ("SO DAN", f"{bullets}/{MAX_BULLETS}"),
+                ("XEP LOAI", rank),
+            ]
+
+            cv2.rectangle(
+                canvas,
+                (table_x, table_y),
+                (table_x + col_w1 + col_w2, table_y + row_h * len(rows)),
+                (40, 40, 40),
+                -1
+            )
+
+            cv2.rectangle(
+                canvas,
+                (table_x, table_y),
+                (table_x + col_w1 + col_w2, table_y + row_h * len(rows)),
+                (0, 255, 255),
+                2
+            )
+
+            for i, (label, value) in enumerate(rows):
+                y = table_y + i * row_h
+
+                cv2.line(
+                    canvas,
+                    (table_x, y),
+                    (table_x + col_w1 + col_w2, y),
+                    (0, 255, 255),
+                    1
+                )
+
+                cv2.putText(
+                    canvas,
+                    label,
+                    (table_x + 10, y + 32),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    (255, 255, 255),
+                    2
+                )
+
+                cv2.putText(
+                    canvas,
+                    value,
+                    (table_x + col_w1 + 20, y + 32),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    (0, 255, 255),
+                    2
+                )
+
+            if not tts_spoken and result_time and time.time() - result_time >= 0.8:
+                play_result_sound(rank)
                 tts_spoken = True
 
         cv2.putText(canvas, f"SCORE: {score}", (40, 60),
